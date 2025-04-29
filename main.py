@@ -69,7 +69,7 @@ class WaymoFrameParser:
         """Returns a sorted list of unique frame timestamps."""
         return self.timestamps
 
-    def get_frame_images(self, timestamp_micros):
+    def get_timestamp_data(self, timestamp_micros):
         """
         Retrieves all camera image data for a specific frame timestamp.
 
@@ -125,23 +125,44 @@ class WaymoFrameParser:
         except Exception as e:
             warnings.warn(f"Error decoding image: {e}", UserWarning)
             return None
+        
+    def get_timestamp_images(self, timestamp_micros):
+        """
+        Retrieves all camera images for a specific frame timestamp.
 
+        Args:
+            timestamp_micros: The frame timestamp in microseconds.
 
-segment_id = '1005081002024129653_5313_150_5333_150'
+        Returns:
+            A dictionary where keys are camera names and values are the decoded images (PIL Image objects).
+            Returns None if the timestamp is not found or no images exist for it.
+        """
+        if timestamp_micros not in self.timestamps:
+            warnings.warn(f"Timestamp {timestamp_micros} not found.", UserWarning)
+            return None
+        timestamp_data = self.get_timestamp_data(timestamp_micros)
+        if timestamp_data is None or timestamp_data is {}:
+            warnings.warn(f"Failed to retrieve data for timestamp {timestamp_micros}.", UserWarning)
+            return None
+        timestamp_images = {}
+        for camera_name, image_data in timestamp_data.items():
+            image_bytes = image_data['[CameraImageComponent].image']
+            decoded_image = self.decode_image(image_bytes)
+            if decoded_image is not None:
+                timestamp_images[camera_name] = decoded_image
+            else:
+                warnings.warn(f"Failed to decode image for camera {camera_name} at timestamp {timestamp_micros}.", UserWarning)
+        return timestamp_images
+
+segment_id = SEGMENT_IDS[0]
 data = load_waymo_data_from_structure(DATASET_BASE_DIR, segment_id)
 frameParser = WaymoFrameParser(data)
 timestamps = frameParser.get_timestamps()
 print(f"Number of timestamps: {len(timestamps)}")
 for timestamp in timestamps[:1]:
-    frame_images = frameParser.get_frame_images(timestamp)
+    frame_images = frameParser.get_timestamp_images(timestamp)
     if frame_images:
-        for camera_name, image_data in frame_images.items():
-            image_bytes = image_data['[CameraImageComponent].image']
-            decoded_image = frameParser.decode_image(image_bytes)
-            if image_data is not None:
-                print(f"Image from {camera_name} at timestamp {timestamp}: {image_data}")
-                decoded_image.show()
-            else:
-                print(f"Failed to decode image from {camera_name} at timestamp {timestamp}")
+        for camera_name, image in frame_images.items():
+            print(f"Camera: {camera_name}, Image size: {image.size}")
     else:
         print(f"No images found for timestamp {timestamp}")
