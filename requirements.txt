@@ -1,0 +1,14 @@
+#requirements.txt
+
+waymo-open-dataset-tf-2-12-0
+
+pandas
+pyarrow
+numpy
+scikit-learn
+
+#Visualization
+matplotlib
+
+#Image Handling
+Pillow
