@@ -1,3 +1,5 @@
+import time
+from matplotlib import pyplot as plt
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -154,15 +156,199 @@ class WaymoFrameParser:
                 warnings.warn(f"Failed to decode image for camera {camera_name} at timestamp {timestamp_micros}.", UserWarning)
         return timestamp_images
 
-segment_id = SEGMENT_IDS[0]
-data = load_waymo_data_from_structure(DATASET_BASE_DIR, segment_id)
-frameParser = WaymoFrameParser(data)
-timestamps = frameParser.get_timestamps()
-print(f"Number of timestamps: {len(timestamps)}")
-for timestamp in timestamps[:1]:
-    frame_images = frameParser.get_timestamp_images(timestamp)
-    if frame_images:
-        for camera_name, image in frame_images.items():
-            print(f"Camera: {camera_name}, Image size: {image.size}")
-    else:
-        print(f"No images found for timestamp {timestamp}")
+class FASTPCornerDetection:
+    def __init__(self, t=20, n=9):
+        """
+        Initializes the FAST detector parameters.
+
+        Args:
+            t (int): Intensity difference threshold.
+            n (int): Required number of contiguous pixels in the circle arc (9 or 12).
+        """
+        self._threshold = t
+        self._n = n
+        
+        self._circle_offsets = np.array([
+            [ 0,  3], [ 1,  3], [ 2,  2], [ 3,  1], [ 3,  0], [ 3, -1],
+            [ 2, -2], [ 1, -3], [ 0, -3], [-1, -3], [-2, -2], [-3, -1],
+            [-3,  0], [-3,  1], [-2,  2], [-1,  3]
+        ], dtype=np.int8)
+        
+        self._n8_offsets = np.array([
+            [ 0,  1], [ 1,  1], [ 1,  0], [ 1, -1], [ 0, -1], [-1, -1],
+            [-1,  0], [-1,  1]
+        ], dtype=np.int8)
+        
+        self._quick_test_offsets = self._circle_offsets[[0, 4, 8, 12]]
+        
+        self._quick_test_reject_limit = 3
+        self._radius = 3
+
+    def detect_corners(self, image):
+        """
+        Detects FAST corners in the input image.
+
+        Args:
+            image (PIL.Image.Image): The input image.
+
+        Returns:
+            np.ndarray: A boolean NumPy array of the same shape as the image,
+                        where True indicates a detected corner.
+        """
+        if image is None:
+            raise ValueError("Input image cannot be None.")
+            
+        grayscale_image = image.convert("L")
+        image_array = np.array(grayscale_image, dtype=np.int16) 
+        height, width = image_array.shape
+        corners = np.zeros((height, width), dtype=bool)
+        corner_score = np.zeros((height, width), dtype=np.int32)
+        margin = self._radius
+
+        for i in range(margin, height - margin):
+            for j in range(margin, width - margin):
+                is_corner_flag, score = self._is_corner(image_array, i, j)
+                if is_corner_flag:
+                    corners[i, j] = True
+                    corner_score[i, j] = score
+
+        final_corners = self._non_maximal_suppression(corners, corner_score)
+        return final_corners
+
+    def _is_inside(self, shape, lin, col):
+        """Checks if the given (row, col) coordinates are within the image bounds."""
+        height, width = shape
+        return 0 <= col < width and 0 <= lin < height
+
+    def _non_maximal_suppression(self, corners, corner_score):
+        """
+        Applies non-maximal suppression to the detected corners.
+        Score is computed as the sum of the abs value of the intensity differences.
+
+        Args:
+            corners (np.ndarray): Boolean mask of provisionally detected corners.
+            corner_score (np.ndarray): Array containing the score for each pixel.
+
+        Returns:
+            np.ndarray: Boolean mask of corners after suppression.
+        """
+        height, width = corners.shape
+        suppressed_corners = corners.copy() 
+        corner_indices = np.argwhere(corners)
+        for i, j in corner_indices:
+            for offset in self._n8_offsets:
+                ni, nj = i + offset[0], j + offset[1]
+                if self._is_inside(corners.shape, ni, nj) and \
+                   corners[ni, nj] and \
+                   corner_score[ni, nj] > corner_score[i, j]:
+                    suppressed_corners[i, j] = False
+                    break
+        return suppressed_corners
+
+    def _get_corner_score(self, image_array, lin, col, circle_intensities):
+        """
+        Calculates the corner score (sum of absolute differences).
+
+        Args:
+            image_array (np.ndarray): The grayscale image array.
+            lin (int): Line index of the center pixel.
+            col (int): Column index of the center pixel.
+            circle_intensities (np.ndarray): Pre-fetched intensities of the 16 circle pixels.
+
+        Returns:
+            int: The calculated corner score.
+        """
+        center_intensity = image_array[lin, col]
+        corner_score = np.sum(np.abs(circle_intensities - center_intensity))
+        return corner_score # Return the calculated score
+
+    def _is_corner(self, image_array, lin, col):
+        """
+        Checks if a pixel is a corner using the FAST algorithm.
+
+        Args:
+            image_array (np.ndarray): The grayscale image array.
+            lin (int): Row index of the candidate pixel.
+            col (int): Column index of the candidate pixel.
+
+        Returns:
+            tuple[bool, int]: (True, score) if it's a corner, (False, 0) otherwise.
+                                Score is calculated only if it's a corner.
+        """
+        if self._quick_test_rejects(image_array, lin, col):
+            return False, 0
+
+        center_intensity = image_array[lin, col]
+        pixel_states = np.zeros(16, dtype=np.int8)
+        circle_intensities = np.zeros(16, dtype=np.int16) 
+        for i in range(self._circle_offsets.shape[0]):
+            lin_offset, col_offset = self._circle_offsets[i]
+            pixel_intensity = image_array[lin + lin_offset, col + col_offset]
+            circle_intensities[i] = pixel_intensity
+            if pixel_intensity > center_intensity + self._threshold:
+                pixel_states[i] = 1
+            elif pixel_intensity < center_intensity - self._threshold:
+                pixel_states[i] = -1
+
+        pixel_states_wrapped = np.concatenate((pixel_states, pixel_states))
+        max_contiguous_brighter = 0
+        max_contiguous_darker = 0
+        current_brighter = 0
+        current_darker = 0
+        found_arc = False
+        for state in pixel_states_wrapped:
+            if state == 1:
+                current_brighter += 1
+                max_contiguous_darker = max(max_contiguous_darker, current_darker)
+                current_darker = 0
+            elif state == -1:
+                current_darker += 1
+                max_contiguous_brighter = max(max_contiguous_brighter, current_brighter)
+                current_brighter = 0
+            else:
+                current_brighter = 0
+                current_darker = 0
+            if current_brighter >= self._n or current_darker >= self._n:
+                found_arc = True
+                break
+
+        if found_arc:
+            score = self._get_corner_score(image_array, lin, col, circle_intensities)
+            return True, score
+        else:
+            return False, 0
+
+    def _quick_test_rejects(self, image_array, lin, col):
+        """
+        Test to quickly check for non-corners.
+
+        Args:
+            image_array (np.ndarray): The grayscale image array.
+            lin (int): Row index of the candidate pixel.
+            col (int): Column index of the candidate pixel.
+
+        Returns:
+            bool: True if the pixel should be REJECTED (quick test failed), 
+                  False otherwise (pixel might still be a corner).
+        """
+        center_intensity = image_array[lin, col]
+        similar_count = 0
+        for offset in self._quick_test_offsets:
+            px_intensity = image_array[lin + offset[0], col + offset[1]]
+            if abs(px_intensity - center_intensity) <= self._threshold:
+                similar_count += 1
+                
+        return similar_count >= self._quick_test_reject_limit
+
+# segment_id = SEGMENT_IDS[0]
+# data = load_waymo_data_from_structure(DATASET_BASE_DIR, segment_id)
+# frameParser = WaymoFrameParser(data)
+# timestamps = frameParser.get_timestamps()
+# print(f"Number of timestamps: {len(timestamps)}")
+# for timestamp in timestamps[:1]:
+#     frame_images = frameParser.get_timestamp_images(timestamp)
+#     if frame_images:
+#         for camera_name, image in frame_images.items():
+#             print(f"Camera: {camera_name}, Image size: {image.size}")
+#     else:
+#         print(f"No images found for timestamp {timestamp}")
