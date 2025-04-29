@@ -340,6 +340,124 @@ class FASTPCornerDetection:
                 
         return similar_count >= self._quick_test_reject_limit
 
+class BRIEFDescriptor:
+    def __init__(self, descriptor_size=256, patch_size=31, gaussian_sigma=None):
+        """
+        Initializes the BRIEF descriptor extractor.
+
+        Args:
+            descriptor_size (int): The desired length of the descriptor in bits (e.g., 128, 256, 512).
+            patch_size (int): The size of the square patch around the keypoint (must be odd).
+            gaussian_sigma (float | None): Sigma for Gaussian blur applied to the patch
+                                          before sampling. If None, no smoothing is applied.
+                                          Requires SciPy installed if not None.
+        """
+        if patch_size % 2 == 0:
+            raise ValueError("patch_size must be odd.")
+            
+        self.descriptor_size = descriptor_size
+        self.patch_size = patch_size
+        self.gaussian_sigma = gaussian_sigma
+        self._half_patch = patch_size // 2
+        
+        self._sampling_pairs = self._generate_sampling_pairs()
+
+        if self.gaussian_sigma is not None:
+            try:
+                from scipy.ndimage import gaussian_filter
+                self._gaussian_filter = gaussian_filter
+            except ImportWarning:
+                warnings.warn("SciPy is not installed. Gaussian smoothing will not be applied.", UserWarning)    
+                self._gaussian_filter = None
+                self.gaussian_sigma = None
+        else:
+            self._gaussian_filter = None
+
+    def _generate_sampling_pairs(self):
+        """
+        Generates the random sampling pairs relative to the patch center.
+        Uses a Gaussian distribution, clamped to patch boundaries.
+        """
+        pairs = np.zeros((self.descriptor_size, 2, 2), dtype=np.int16)
+        std_deviation = self.patch_size / 5.0 
+        max_offset = self._half_patch
+        rng = np.random.default_rng()
+
+        for i in range(self.descriptor_size):
+            coords = rng.normal(loc=0.0, scale=std_deviation, size=4)
+            coords = np.clip(coords, -max_offset, max_offset)
+            pairs[i, 0, 0] = int(coords[0]) 
+            pairs[i, 0, 1] = int(coords[1])
+            pairs[i, 1, 0] = int(coords[2])
+            pairs[i, 1, 1] = int(coords[3])
+            #Modify second coordinate if random generation gives an identical pair
+            if pairs[i, 0, 0] == pairs[i, 1, 0] and pairs[i, 0, 1] == pairs[i, 1, 1]:
+                 if pairs[i, 1, 1] < max_offset:
+                     pairs[i, 1, 1] += 1
+                 else:
+                      pairs[i, 1, 1] -= 1
+                      
+        return pairs
+    
+    def compute(self, image_array, keypoints):
+        """
+        Computes BRIEF descriptors for the given keypoints.
+
+        Args:
+            image_array (np.ndarray): The grayscale input image (NumPy array, dtype typically uint8 or int16).
+            keypoints (list[tuple[int, int]]): A list of (row, col) coordinates
+                                              for which to compute descriptors.
+
+        Returns:
+            tuple[list[tuple[int, int]], list[np.ndarray]]:
+                - valid_keypoints: A list of (row, col) for which descriptors were successfully computed.
+                - descriptors: A list of NumPy arrays (uint8, length=descriptor_size),
+                               the computed descriptors corresponding to valid_keypoints.
+        """
+        if image_array.ndim != 2:
+            raise ValueError("Input image must be grayscale (2D array).")
+            
+        height, width = image_array.shape
+        valid_keypoints = []
+        descriptors = []
+        image_array_int = image_array.astype(np.int16) 
+
+        for lin, col in keypoints:
+            if not (self._half_patch <= lin < height - self._half_patch and \
+                    self._half_patch <= col < width - self._half_patch):
+                continue
+            
+            lin_start, lin_end = lin - self._half_patch, lin + self._half_patch + 1
+            col_start, col_end = col - self._half_patch, col + self._half_patch + 1
+            patch = image_array_int[lin_start:lin_end, col_start:col_end]
+            if self._gaussian_filter is not None and self.gaussian_sigma is not None:
+                 current_patch = self._gaussian_filter(patch, sigma=self.gaussian_sigma).astype(np.int16)
+            else:
+                 current_patch = patch
+            descriptor = np.zeros(self.descriptor_size, dtype=np.uint8)
+            center_lin, center_col = self._half_patch, self._half_patch
+
+            for i in range(self.descriptor_size):
+                l1, c1 = self._sampling_pairs[i, 0, :]
+                l2, c2 = self._sampling_pairs[i, 1, :]
+                pl1, pc1 = center_lin + l1, center_col + c1
+                pl2, pc2 = center_lin + l2, center_col + c2
+                if not (0 <= pl1 < patch.shape[0] and 0 <= pc1 < patch.shape[1] and \
+                        0 <= pl2 < patch.shape[0] and 0 <= pc2 < patch.shape[1]):
+                    continue
+                intensity_p = current_patch[pl1, pc1]
+                intensity_q = current_patch[pl2, pc2]
+                if intensity_p < intensity_q:
+                    descriptor[i] = 1
+            
+            valid_keypoints.append((lin, col))
+            descriptors.append(descriptor)
+
+        return valid_keypoints, descriptors
+
+
+    
+
 # segment_id = SEGMENT_IDS[0]
 # data = load_waymo_data_from_structure(DATASET_BASE_DIR, segment_id)
 # frameParser = WaymoFrameParser(data)
