@@ -117,13 +117,6 @@ class WaymoFrameParser:
              warnings.warn("Invalid image bytes provided for decoding.", UserWarning)
              return None
         try:
-            if len(image_bytes) < 100:
-                 is_likely_image = False
-                 if image_bytes.startswith(b'\xff\xd8'): is_likely_image = True
-                 elif image_bytes.startswith(b'\x89PNG\r\n\x1a\n'): is_likely_image = True
-                 if not is_likely_image:
-                      warnings.warn(f"Image bytes length ({len(image_bytes)}) seems too small and lacks common headers. Skipping decode.", UserWarning)
-                      return None
             return Image.open(io.BytesIO(image_bytes))
         except Exception as e:
             warnings.warn(f"Error decoding image: {e}", UserWarning)
@@ -296,7 +289,7 @@ class FASTPCornerDetection:
         max_contiguous_darker = 0
         current_brighter = 0
         current_darker = 0
-        found_arc = False
+        found = False
         for state in pixel_states_wrapped:
             if state == 1:
                 current_brighter += 1
@@ -310,10 +303,10 @@ class FASTPCornerDetection:
                 current_brighter = 0
                 current_darker = 0
             if current_brighter >= self._n or current_darker >= self._n:
-                found_arc = True
+                found = True
                 break
 
-        if found_arc:
+        if found:
             score = self._get_corner_score(image_array, lin, col, circle_intensities)
             return True, score
         else:
@@ -552,7 +545,116 @@ class FeatureMatcher:
         xor_result = np.bitwise_xor(descriptor1, descriptor2)
         distance = np.sum(np.unpackbits(xor_result))
         return int(distance)
+    
+class RANSACHomography:
+    """
+    Estimates the Homography matrix between two sets of corresponding points
+    using the RANSAC algorithm with the Direct Linear Transform (DLT).
+    """
+    def __init__(self, num_iterations=1000, inlier_threshold=3.0):
+        """
+        Initializes the RANSAC Homography estimator.
 
+        Args:
+            num_iterations (int): Number of RANSAC iterations to perform.
+            inlier_threshold (float): Maximum reprojection error (in pixels)
+                                        for a point pair to be considered an inlier.
+        """
+        self.num_iterations = num_iterations
+        self.inlier_threshold = inlier_threshold
+        self.min_samples = 4
+        
+    def _compute_homography_dlt(self, pts1: np.ndarray, pts2: np.ndarray) -> np.ndarray:
+        """
+        Computes the Homography matrix using the Direct Linear Transform (DLT).
+
+        Args:
+            pts1 (np.ndarray): Source points (shape: Nx2).
+            pts2 (np.ndarray): Destination points (shape: Nx2).
+
+        Returns:
+            np.ndarray: The computed Homography matrix (3x3).
+        """
+        A = []
+        for i in range(pts1.shape[0]):
+            x1, y1 = pts1[i]
+            x2, y2 = pts2[i]
+            A.append([-x1, -y1, -1, 0, 0, 0, x2*x1, x2*y1, x2])
+            A.append([0, 0, 0, -x1, -y1, -1, y2*x1, y2*y1, y2])
+        A = np.array(A)
+        try:
+            _, _, Vt = np.linalg.svd(A)
+            H = Vt[-1].reshape(3, 3)
+            return H
+        except np.linalg.LinAlgError:
+            raise ValueError("SVD failed to compute Homography matrix.")
+        
+    def get_homography(self, 
+                    keypoints1: List[Tuple[int, int]], 
+                    keypoints2: List[Tuple[int, int]], 
+                    matches: List[Tuple[int, int, int]]
+                    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Finds the best Homography matrix using RANSAC.
+
+        Args:
+            keypoints1 (list): List of (row, col) tuples for image 1.
+            keypoints2 (list): List of (row, col) tuples for image 2.
+            matches (list): List of good matches [(idx1, idx2, distance), ...].
+
+        Returns:
+            Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+                - best_H: The estimated 3x3 Homography matrix (or None if failed).
+                - best_inlier_mask: A boolean mask indicating which matches were inliers (or None).
+        """
+
+        if len(matches) < self.min_samples:
+            return None, None
+        
+        pts1 = np.float32([ [keypoints1[m[0]][1], keypoints1[m[0]][0]] for m in matches ])
+        pts2 = np.float32([ [keypoints2[m[1]][1], keypoints2[m[1]][0]] for m in matches ])
+        num_matches = len(matches)
+        best_H: Optional[np.ndarray] = None
+        max_inliers: int = -1
+        best_inlier_mask: Optional[np.ndarray] = None
+        rng = np.random.default_rng()
+
+        for k in range(self.num_iterations):
+            if num_matches >= self.min_samples:
+                 sample_indices = rng.choice(num_matches, self.min_samples, replace=False)
+            else:
+                 continue
+            sample_pts1 = pts1[sample_indices]
+            sample_pts2 = pts2[sample_indices]
+            H_candidate = self._compute_homography_dlt(sample_pts1, sample_pts2)
+            if H_candidate is None:
+                continue
+            try:
+                pts1_h = np.hstack((pts1, np.ones((num_matches, 1))))
+                pts1_transformed_h = (H_candidate @ pts1_h.T).T
+                
+                z_coords = pts1_transformed_h[:, 2]
+
+                valid_z = np.abs(z_coords) > 1e-8
+                
+                pts1_transformed = np.zeros_like(pts1)
+                
+                pts1_transformed[valid_z] = pts1_transformed_h[valid_z, :2] / z_coords[valid_z, np.newaxis]
+                
+                diff = pts1_transformed - pts2
+                squared_distances = np.sum(diff**2, axis=1)
+
+                inlier_mask = (squared_distances < self.inlier_threshold**2) & valid_z
+                num_inliers = np.sum(inlier_mask)
+
+                if num_inliers > max_inliers:
+                    max_inliers = num_inliers
+                    best_H = H_candidate
+                    best_inlier_mask = inlier_mask
+            except Exception:
+                 continue
+             
+        return best_H, best_inlier_mask
 # segment_id = SEGMENT_IDS[0]
 # data = load_waymo_data_from_structure(DATASET_BASE_DIR, segment_id)
 # frameParser = WaymoFrameParser(data)
