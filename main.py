@@ -1,4 +1,5 @@
 import time
+from typing import List, Optional, Tuple
 from matplotlib import pyplot as plt
 import pandas as pd
 import numpy as np
@@ -455,8 +456,102 @@ class BRIEFDescriptor:
 
         return valid_keypoints, descriptors
 
+class FeatureMatcher:
+    """
+    Matches binary feature descriptors using Hamming distance and Lowe's ratio test.
+    """
+    def __init__(self, ratio_threshold: float = 0.75):
+        """
+        Initializes the feature matcher.
 
+        Args:
+            ratio_threshold (float): The threshold for Lowe's ratio test. 
+                                     A match is kept if distance(best) < ratio * distance(second_best).
+        """
+        self.ratio_threshold = ratio_threshold
+
+    def match(self, 
+              descriptors1: np.ndarray, 
+              descriptors2: np.ndarray
+             ) -> List[Tuple[int, int, int]]:
+        """
+        Finds good matches between two sets of descriptors using ratio test.
+
+        Args:
+            descriptors1 (np.ndarray): N1 x D array of descriptors (dtype=uint8).
+            descriptors2 (np.ndarray): N2 x D array of descriptors (dtype=uint8).
+
+        Returns:
+            List[Tuple[int, int, int]]: A list of good matches, where each tuple is
+                                        (index_in_descriptors1, index_in_descriptors2, hamming_distance).
+        """
+        matches: List[Tuple[int, int, int]] = []
+        num_descriptors1 = descriptors1.shape[0]
+        num_descriptors2 = descriptors2.shape[0]
+        if num_descriptors1 == 0 or num_descriptors2 < 2:
+            return matches 
+        for index1 in range(num_descriptors1):
+            d1 = descriptors1[index1]
+            best_match, second_match, best_dist, second_dist = self._get_best_2_matches(d1, descriptors2)
+            if best_match is not None and second_match is not None:
+                if best_dist < self.ratio_threshold * second_dist:
+                    matches.append((index1, best_match, best_dist))
+        return matches
     
+    def _get_best_2_matches(self, 
+                           target_descriptor: np.ndarray, 
+                           descriptors: np.ndarray
+                          ) -> Tuple[Optional[int], Optional[int], int, int]:
+        """
+        Finds the indices and distances of the best and second-best matches 
+        for a target descriptor within a set of descriptors using Hamming distance.
+
+        Args:
+            target_descriptor (np.ndarray): The single descriptor (1D array, uint8) to match.
+            descriptors (np.ndarray): The set of descriptors (2D array, uint8) to search within.
+
+        Returns:
+            Tuple[Optional[int], Optional[int], int, int]: 
+                (best_match_index, second_match_index, best_distance, second_distance).
+                Indices can be None if fewer than two descriptors were provided.
+                Distances are initialized to infinity.
+        """
+        best_match_index: Optional[int] = None
+        second_match_index: Optional[int] = None
+        best_distance: int = np.iinfo(np.int32).max 
+        second_best_distance: int = np.iinfo(np.int32).max
+        for i, descriptor in enumerate(descriptors):
+            distance = self.hamming_distance(target_descriptor, descriptor)
+            if distance < best_distance:
+                second_best_distance = best_distance
+                second_match_index = best_match_index
+                best_distance = distance
+                best_match_index = i
+            elif distance < second_best_distance:
+                second_best_distance = distance
+                second_match_index = i
+        return best_match_index, second_match_index, best_distance, second_best_distance
+    
+    def hamming_distance(self, 
+                         descriptor1: np.ndarray, 
+                         descriptor2: np.ndarray
+                        ) -> int:
+        """
+        Computes the Hamming distance (number of differing bits) between two 
+        binary descriptors represented as NumPy arrays of uint8.
+
+        Args:
+            descriptor1 (np.ndarray): First descriptor (1D array, uint8).
+            descriptor2 (np.ndarray): Second descriptor (1D array, uint8).
+
+        Returns:
+            int: The Hamming distance.
+        """
+        if descriptor1.shape != descriptor2.shape:
+            raise ValueError("Descriptors must have the same shape.")
+        xor_result = np.bitwise_xor(descriptor1, descriptor2)
+        distance = np.sum(np.unpackbits(xor_result))
+        return int(distance)
 
 # segment_id = SEGMENT_IDS[0]
 # data = load_waymo_data_from_structure(DATASET_BASE_DIR, segment_id)
