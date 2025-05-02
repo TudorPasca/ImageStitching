@@ -1,5 +1,6 @@
 import time
 from typing import List, Optional, Tuple
+import cv2
 from matplotlib import pyplot as plt
 import pandas as pd
 import numpy as np
@@ -655,12 +656,67 @@ class RANSACHomography:
                  continue
              
         return best_H, best_inlier_mask
+    
+class ImageTransformer:
+    """ Transforms an image using a the Homography matrix. """
+    
+    def transform(self, 
+                         image_src: np.ndarray, 
+                         H: np.ndarray, 
+                         output_shape: Tuple[int, int], 
+                         interpolation_flag: int = cv2.INTER_LINEAR, 
+                         border_mode: int = cv2.BORDER_CONSTANT, 
+                         border_value: int = 0):
+        """
+        Applies transform using cv2.warpPerspective.
+
+        Args:
+            image_src (np.ndarray): The source image (H x W or H x W x C, uint8).
+                                    Must be a NumPy array.
+            H (np.ndarray): The 3x3 Homography matrix mapping points 
+                            FROM source TO output canvas coordinates.
+            output_shape (Tuple[int, int]): Desired (height, width) of the 
+                                            warped output image.
+            interpolation_flag (int): OpenCV interpolation flag, e.g., 
+                                      cv2.INTER_LINEAR (default), cv2.INTER_NEAREST, 
+                                      cv2.INTER_CUBIC.
+            border_mode (int): OpenCV border mode, e.g., cv2.BORDER_CONSTANT (default).
+            border_value (int): Value used for border pixels if 
+                                                    border_mode is cv2.BORDER_CONSTANT. 
+                                                    Use int for grayscale.
+
+        Returns:
+            Optional[np.ndarray]: The warped image (NumPy array), or None if OpenCV is unavailable.
+        """
+    
+        if image_src is None or H is None:
+            print("Error: Source image or Homography matrix is None.")
+            return None
+            
+        output_width = output_shape[1]
+        output_height = output_shape[0]
+        dsize = (output_width, output_height)
+        try:
+            warped_image = cv2.warpPerspective(
+                src=image_src,
+                M=H,
+                dsize=dsize,
+                flags=interpolation_flag,
+                borderMode=border_mode,
+                borderValue=border_value
+            )
+            return warped_image
+        except Exception as e:
+            print(f"Error during cv2.warpPerspective: {e}")
+            return np.full(output_shape, border_value, dtype=image_src.dtype)
+    
 # segment_id = SEGMENT_IDS[0]
 # data = load_waymo_data_from_structure(DATASET_BASE_DIR, segment_id)
 # frameParser = WaymoFrameParser(data)
 # timestamps = frameParser.get_timestamps()
 # print(f"Number of timestamps: {len(timestamps)}")
 # for timestamp in timestamps[:1]:
+#     print(frameParser.get_timestamp_data(timestamp))
 #     frame_images = frameParser.get_timestamp_images(timestamp)
 #     if frame_images:
 #         for camera_name, image in frame_images.items():
