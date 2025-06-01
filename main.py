@@ -8,13 +8,15 @@ from pathlib import Path
 from PIL import Image
 import io
 import warnings
+import os
+from datetime import datetime
 
-DATASET_BASE_DIR = Path('./dataset')
+DATASET_BASE_DIR = Path('./dataset/camera_image')
 
 SEGMENT_IDS = [
     '1005081002024129653_5313_150_5333_150',
     '10017090168044687777_6380_000_6400_000',
-    '0023947602400723454_1120_000_1140_000',
+    '10023947602400723454_1120_000_1140_000',
     '10061305430875486848_1080_000_1100_000',
     '10072140764565668044_4060_000_4080_000'
 ]
@@ -28,25 +30,19 @@ def load_waymo_data_from_structure(base_dir: Path, segment_id: str):
          print("Error: TARGET_SEGMENT_ID is not set. Please update the variable in the script.")
          return None
 
-    data = {'image': None, 'calibration': None, 'pose': None}
+    data = {'image': None}
 
-    component_map = {
-        'image': 'camera_image',
-        'calibration': 'camera_calibration',
-        'pose': 'vehicle_pose' 
-    }
-
-    for data_key, sub_dir_name in component_map.items():
-        component_dir = base_dir / sub_dir_name
-        file_path = component_dir / f"{segment_id}.parquet"
-        if file_path.is_file():
-            try:
-                data[data_key] = pd.read_parquet(file_path, engine='pyarrow')
-            except Exception as e:
-                print(f"Error loading {file_path}: {e}")
-                data[data_key] = None
-        else:
-            warnings.warn(f"Warning: File not found: {file_path}", UserWarning)
+    file_path = base_dir / f"{segment_id}.parquet"
+    if file_path.is_file():
+        try:
+            df = pd.read_parquet(file_path, engine='pyarrow')
+            data['image'] = df[df['component_type'] == 'camera_image'] if 'component_type' in df.columns else df
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            return None
+    else:
+        warnings.warn(f"Warning: File not found: {file_path}", UserWarning)
+        return None
 
     if data['image'] is None:
          print(f"Error: Extraction failed for {segment_id}")
@@ -167,12 +163,12 @@ class FASTPCornerDetection:
             [ 0,  3], [ 1,  3], [ 2,  2], [ 3,  1], [ 3,  0], [ 3, -1],
             [ 2, -2], [ 1, -3], [ 0, -3], [-1, -3], [-2, -2], [-3, -1],
             [-3,  0], [-3,  1], [-2,  2], [-1,  3]
-        ], dtype=np.int8)
+        ], dtype=np.int16)
         
         self._n8_offsets = np.array([
             [ 0,  1], [ 1,  1], [ 1,  0], [ 1, -1], [ 0, -1], [-1, -1],
             [-1,  0], [-1,  1]
-        ], dtype=np.int8)
+        ], dtype=np.int16)
         
         self._quick_test_offsets = self._circle_offsets[[0, 4, 8, 12]]
         
@@ -336,7 +332,7 @@ class FASTPCornerDetection:
         return similar_count >= self._quick_test_reject_limit
 
 class BRIEFDescriptor:
-    def __init__(self, descriptor_size=256, patch_size=31, gaussian_sigma=None):
+    def __init__(self, descriptor_size=256, patch_size=31, gaussian_sigma=None, seed=42):
         """
         Initializes the BRIEF descriptor extractor.
 
@@ -346,6 +342,7 @@ class BRIEFDescriptor:
             gaussian_sigma (float | None): Sigma for Gaussian blur applied to the patch
                                           before sampling. If None, no smoothing is applied.
                                           Requires SciPy installed if not None.
+            seed (int): Random seed for generating sampling pairs.
         """
         if patch_size % 2 == 0:
             raise ValueError("patch_size must be odd.")
@@ -354,6 +351,7 @@ class BRIEFDescriptor:
         self.patch_size = patch_size
         self.gaussian_sigma = gaussian_sigma
         self._half_patch = patch_size // 2
+        self._seed = seed
         
         self._sampling_pairs = self._generate_sampling_pairs()
 
@@ -376,7 +374,7 @@ class BRIEFDescriptor:
         pairs = np.zeros((self.descriptor_size, 2, 2), dtype=np.int16)
         std_deviation = self.patch_size / 5.0 
         max_offset = self._half_patch
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(seed=self._seed)
 
         for i in range(self.descriptor_size):
             coords = rng.normal(loc=0.0, scale=std_deviation, size=4)
@@ -552,7 +550,7 @@ class RANSACHomography:
     Estimates the Homography matrix between two sets of corresponding points
     using the RANSAC algorithm with the Direct Linear Transform (DLT).
     """
-    def __init__(self, num_iterations=1000, inlier_threshold=3.0):
+    def __init__(self, num_iterations=1000, inlier_threshold=3.0, seed=42):
         """
         Initializes the RANSAC Homography estimator.
 
@@ -560,10 +558,13 @@ class RANSACHomography:
             num_iterations (int): Number of RANSAC iterations to perform.
             inlier_threshold (float): Maximum reprojection error (in pixels)
                                         for a point pair to be considered an inlier.
+            seed (int): Random seed for RANSAC sampling.
         """
         self.num_iterations = num_iterations
         self.inlier_threshold = inlier_threshold
         self.min_samples = 4
+        self._seed = seed
+        self._rng = np.random.default_rng(seed=seed)
         
     def _compute_homography_dlt(self, pts1: np.ndarray, pts2: np.ndarray) -> np.ndarray:
         """
@@ -618,11 +619,10 @@ class RANSACHomography:
         best_H: Optional[np.ndarray] = None
         max_inliers: int = -1
         best_inlier_mask: Optional[np.ndarray] = None
-        rng = np.random.default_rng()
 
         for k in range(self.num_iterations):
             if num_matches >= self.min_samples:
-                 sample_indices = rng.choice(num_matches, self.min_samples, replace=False)
+                 sample_indices = self._rng.choice(num_matches, self.min_samples, replace=False)
             else:
                  continue
             sample_pts1 = pts1[sample_indices]
@@ -655,6 +655,22 @@ class RANSACHomography:
             except Exception:
                  continue
              
+        # if best_H is not None and np.sum(best_inlier_mask) > self.min_samples:
+        #     all_inlier_pts1 = pts1[best_inlier_mask]
+        #     all_inlier_pts2 = pts2[best_inlier_mask]
+        #     try:
+        #         # Re-estimate H using all inliers from the best model
+        #         refined_H = self._compute_homography_dlt(all_inlier_pts1, all_inlier_pts2)
+        #         if refined_H is not None:
+        #             # You might want to ensure the refined_H doesn't drastically increase error,
+        #             # but usually, it's better or very similar for the inlier set.
+        #             best_H = refined_H
+        #     except ValueError: # SVD can fail if inliers are degenerate
+        #         pass # Keep the original best_H from the minimal sample
+        #     except Exception as e:
+        #         print(f"Warning: Error during homography refinement: {e}") # Keep original best_H
+        #         pass
+
         return best_H, best_inlier_mask
     
 class ImageTransformer:
@@ -718,17 +734,7 @@ class ImageTransformer:
     ) -> Optional[Dict[int, np.ndarray]]:
         """
         Calculates homographies mapping each camera view TO the reference camera view.
-
-        Args:
-            pairwise_results (Dict): Dictionary from RANSAC:
-                Keys=(target_cam, source_cam), Values=(H_matrix | None, mask | None).
-            all_cam_nums (List): List of all camera numbers (e.g., [1, 2, 3, 4, 5]).
-            ref_cam_num (int): The number of the reference camera.
-
-        Returns:
-            Optional[Dict[int, np.ndarray]]: A dictionary mapping each camera number
-                to its 3x3 composite homography matrix (H_ref <- i).
-                Returns None if essential homographies are missing.
+        Cameras are arranged in order: 4, 2, 1, 3, 5 from left to right, all at same height.
         """
         composite_H = {}
         identity_matrix = np.eye(3, dtype=np.float32)
@@ -743,47 +749,113 @@ class ImageTransformer:
                 except np.linalg.LinAlgError:
                     warnings.warn(f"Could not invert H mapping {source} to {target}.")
                     
-        paths_to_ref = {
-            1: [], 
-            2: [1], 
-            3: [1],
-            4: [2, 1], 
-            5: [3, 1]
+        expected_positions = {
+            1: (0, 0),
+            2: (-1, 0),
+            3: (1, 0),
+            4: (-2, 0),
+            5: (2, 0)
         }
         
         if ref_cam_num not in all_cam_nums: 
             return None
         
         print(f"\nCalculating homographies relative to camera {ref_cam_num}...")
+        composite_H[ref_cam_num] = identity_matrix
+
         for cam_num in all_cam_nums:
             if cam_num == ref_cam_num:
-                composite_H[cam_num] = identity_matrix
                 continue
-            path = paths_to_ref.get(cam_num)
-            if path is None:
-                print(f"  Warning: No path defined for {cam_num} -> {ref_cam_num}. Skipping.")
-                continue
-            H_comp = identity_matrix
-            current_cam = cam_num
-            possible = True
-            for step_target_cam in path:
-                needed_pair = (step_target_cam, current_cam) 
-                
-                if needed_pair in all_available_H:
-                    H_step = all_available_H[needed_pair]
-                    H_comp = H_step @ H_comp 
-                    current_cam = step_target_cam
-                else:
-                    print(f"  Warning: Missing required pair H for {current_cam} -> {step_target_cam}. "
-                        f"Cannot compute H for {cam_num}.")
-                    possible = False
-                    break 
-            if possible:
-                composite_H[cam_num] = H_comp
-        
+
+            if (ref_cam_num, cam_num) in all_available_H:
+                H = all_available_H[(ref_cam_num, cam_num)]
+                if self._validate_homography(H, expected_positions[cam_num]):
+                    composite_H[cam_num] = H
+                    print(f"  Using direct homography for camera {cam_num}")
+                    continue
+
+            if cam_num in [2, 3]:
+                if (ref_cam_num, cam_num) in all_available_H:
+                    H = all_available_H[(ref_cam_num, cam_num)]
+                    if self._validate_homography(H, expected_positions[cam_num]):
+                        composite_H[cam_num] = H
+                        print(f"  Using validated direct homography for camera {cam_num}")
+                        continue
+
+            if cam_num == 4 and 2 in composite_H:
+                if (2, 4) in all_available_H:
+                    H_2_4 = all_available_H[(2, 4)]
+                    H = composite_H[2] @ H_2_4
+                    if self._validate_homography(H, expected_positions[cam_num]):
+                        composite_H[cam_num] = H
+                        print(f"  Using path through camera 2 for camera {cam_num}")
+                        continue
+
+            if cam_num == 5 and 3 in composite_H:
+                if (3, 5) in all_available_H:
+                    H_3_5 = all_available_H[(3, 5)]
+                    H = composite_H[3] @ H_3_5
+                    if self._validate_homography(H, expected_positions[cam_num]):
+                        composite_H[cam_num] = H
+                        print(f"  Using path through camera 3 for camera {cam_num}")
+                        continue
+
+            # # For camera 5, try a more direct approach if the indirect path failed
+            # if cam_num == 5 and (ref_cam_num, 5) in all_available_H:
+            #     H = all_available_H[(ref_cam_num, 5)]
+            #     if np.sign(H[0, 2]) > 0:  # Check if it moves right
+            #         composite_H[cam_num] = H
+            #         print(f"  Using direct homography for camera {cam_num} (relaxed validation)")
+            #         continue
+
+            print(f"  Warning: Could not find valid homography for camera {cam_num}")
+
         if len(composite_H) != len(all_cam_nums):
             print("Warning: Could not compute composite homographies for all cameras.")
         return composite_H
+
+    def _validate_homography(self, H: np.ndarray, expected_position: Tuple[int, int]) -> bool:
+        """
+        Validates if a homography matrix produces a reasonable transformation.
+        Now focuses on horizontal alignment since all cameras are at the same height.
+        """
+        try:
+            test_points = np.array([
+                [0, 0],
+                [100, 0],
+                [0, 100],
+                [100, 100]
+            ], dtype=np.float32)
+            
+            test_points_h = np.hstack((test_points, np.ones((4, 1))))
+            transformed_points_h = (H @ test_points_h.T).T
+            transformed_points = transformed_points_h[:, :2] / transformed_points_h[:, 2:]
+        
+            translation = np.mean(transformed_points - test_points, axis=0)
+            
+            expected_x, _ = expected_position
+            if expected_x != 0:
+                if expected_x < 0:
+                    if translation[0] > 0:
+                        return False
+                else:
+                    if np.sign(translation[0]) != np.sign(expected_x):
+                        return False
+            
+            # Much more lenient vertical translation check for cameras 4 and 5
+            max_vertical = 1200 if expected_x in [-2, 2] else 800  # Increased for outer cameras
+            if abs(translation[1]) > max_vertical:
+                return False
+            
+            # More lenient threshold for outer cameras
+            max_translation = 6000 if abs(expected_x) == 2 else 4000  # Increased for outer cameras
+            if np.any(np.abs(translation) > max_translation):
+                return False
+                
+            return True
+            
+        except Exception:
+            return False
     
     def calculate_canvas_geometry(
         self,
@@ -793,21 +865,7 @@ class ImageTransformer:
     ) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
         """
         Calculates the required canvas size and offset to fit all transformed images.
-
-        Args:
-            composite_H (Dict): Maps camera number to the 3x3 homography matrix
-                                (H_ref <- i) transforming points from that camera
-                                TO the reference camera's coordinate system.
-                                Should contain np.eye(3) for the reference camera.
-            image_shapes (Dict): Maps camera number to its original (height, width).
-            camera_names (List): List of all camera numbers to consider.
-
-        Returns:
-            Optional[Tuple[Tuple[int, int], Tuple[int, int]]]: 
-                Returns ((canvas_height, canvas_width), (offset_x, offset_y))
-                or None if calculation fails (e.g., no valid transformed corners).
-                offset_x, offset_y define the top-left corner's position relative
-                to the reference frame's origin (0,0).
+        Now uses a more compact approach to minimize black space.
         """
         all_transformed_corners = []
 
@@ -839,6 +897,7 @@ class ImageTransformer:
             )
             
             all_transformed_corners.append(transformed_corners[valid_scale_mask])
+
         if not all_transformed_corners:
             print("Error: Could not determine shape. No valid transformed corners found.")
             return None
@@ -848,21 +907,67 @@ class ImageTransformer:
         min_coords = np.min(all_corners_np, axis=0)
         max_coords = np.max(all_corners_np, axis=0)
         
-        min_x = np.floor(min_coords[0]).astype(int)
-        max_x = np.ceil(max_coords[0]).astype(int)
-        min_y = np.floor(min_coords[1]).astype(int)
-        max_y = np.ceil(max_coords[1]).astype(int)
+        # Calculate dimensions with padding
+        padding = 200  # Add padding to prevent edge clipping
+        width = max_coords[0] - min_coords[0] + 2 * padding
+        height = max_coords[1] - min_coords[1] + 2 * padding
 
-        canvas_width = max_x - min_x
-        canvas_height = max_y - min_y
+        # Ensure minimum size
+        min_size = 2000
+        if width < min_size:
+            width = min_size
+        if height < min_size:
+            height = min_size
 
-        offset_x = -min_x
-        offset_y = -min_y
+        # Scale down if the canvas is too large
+        max_dimension = 6000  # Increased from 4000
+        if width > max_dimension or height > max_dimension:
+            scale_factor = max_dimension / max(width, height)
+            width = int(width * scale_factor)
+            height = int(height * scale_factor)
 
-        print(f"  Calculated Canvas Size (HxW): {canvas_height} x {canvas_width}")
+        # Calculate offset to center the content
+        # First, find the center of the reference camera (camera 1)
+        ref_cam_corners = None
+        for cam_num in camera_names:
+            if cam_num == 1 and cam_num in composite_H and composite_H[cam_num] is not None:
+                h, w = image_shapes[cam_num]
+                ref_corners = np.array([
+                    [0,   0],
+                    [w-1, 0],
+                    [w-1, h-1],
+                    [0,   h-1] 
+                ], dtype=np.float32)
+                ref_corners_h = np.hstack((ref_corners, np.ones((4, 1))))
+                ref_transformed_h = (composite_H[cam_num] @ ref_corners_h.T).T
+                ref_scale = ref_transformed_h[:, 2]
+                valid_scale_mask = np.abs(ref_scale) > 1e-8
+                ref_transformed = np.zeros((4, 2), dtype=np.float32)
+                ref_transformed[valid_scale_mask] = (
+                    ref_transformed_h[valid_scale_mask, :2] / ref_scale[valid_scale_mask, np.newaxis]
+                )
+                ref_cam_corners = ref_transformed
+                break
+
+        if ref_cam_corners is not None:
+            # Use the reference camera's center as the anchor point
+            ref_center = np.mean(ref_cam_corners, axis=0)
+            offset_x = int(width/2 - ref_center[0])
+            offset_y = int(height/2 - ref_center[1])
+        else:
+            # Fallback to using the center of all corners
+            center_x = (min_coords[0] + max_coords[0]) / 2
+            center_y = (min_coords[1] + max_coords[1]) / 2
+            offset_x = int(width/2 - center_x)
+            offset_y = int(height/2 - center_y)
+
+        canvas_height_int = int(np.ceil(height))
+        canvas_width_int = int(np.ceil(width))
+
+        print(f"  Calculated Canvas Size (HxW): {canvas_height_int} x {canvas_width_int}")
         print(f"  Calculated Offset (x, y): ({offset_x}, {offset_y})")
         
-        canvas_shape = (canvas_height, canvas_width)
+        canvas_shape = (canvas_height_int, canvas_width_int)
         canvas_offset = (offset_x, offset_y)
 
         return canvas_shape, canvas_offset
@@ -909,79 +1014,82 @@ class ImageTransformer:
         """
         Warps all original images onto the final canvas size using adjusted homographies
         and creates corresponding binary masks.
-
-        Args:
-            original_images (Dict): Maps camera number to original image (NumPy BGR array).
-            final_homographies (Dict): Maps camera number to the 3x3 homography matrix
-                                    (H_canvas <- i) mapping to the final canvas.
-            canvas_shape (Tuple[int, int]): Final canvas (height, width).
-            camera_names (List): List of camera numbers to process.
-        Returns:
-            Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[int, Tuple[int, int]]]:
-                - warped_images: Dict mapping cam_num to warped image (on canvas).
-                - masks: Dict mapping cam_num to binary mask (on canvas).
-                - corners: Dict mapping cam_num to top-left (x, y) corner on canvas.
         """
-        
         warped_images: Dict[int, np.ndarray] = {}
         masks: Dict[int, np.ndarray] = {}
         corners: Dict[int, Tuple[int, int]] = {}
 
         canvas_height, canvas_width = canvas_shape
-        dsize_cv = (canvas_width, canvas_height)
+        print(f"\nWarping images to canvas size: {canvas_width}x{canvas_height}")
         
         for cam_num in camera_names:
             if cam_num not in original_images:
-                warnings.warn(f"Original image for camera {cam_num} not found. Skipping warp.")
+                print(f"  Skipping camera {cam_num}: No original image")
                 continue
             if cam_num not in final_homographies or final_homographies[cam_num] is None:
-                warnings.warn(f"Final homography for camera {cam_num} not found. Skipping warp.")
+                print(f"  Skipping camera {cam_num}: No homography matrix")
                 continue
 
-            pil_image = original_images[cam_num]
-            img_src_numpy = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-            H_canvas_i = final_homographies[cam_num]
-            src_h, src_w = img_src_numpy.shape[:2]
+            try:
+                pil_image = original_images[cam_num]
+                img_src_numpy = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+                H_canvas_i = final_homographies[cam_num]
+                src_h, src_w = img_src_numpy.shape[:2]
 
-            print(f"  Warping Camera {cam_num}...")
-            warped_img = self.transform(
-                image_src=img_src_numpy,
-                H=H_canvas_i,
-                output_shape=canvas_shape,
-                interpolation_flag=cv2.INTER_LINEAR,
-                border_mode=cv2.BORDER_CONSTANT,
-                border_value=(0, 0, 0)
-            )
-
-            if warped_img is None:
-                warnings.warn(f"Warping failed for camera {cam_num}.")
-                continue
-
-            mask_src = np.ones((src_h, src_w), dtype=np.uint8) * 255
-            mask = self.transform(
-                image_src=mask_src,
-                H=H_canvas_i,
-                output_shape=canvas_shape,
-                interpolation_flag=cv2.INTER_NEAREST,
-                border_mode=cv2.BORDER_CONSTANT,
-                border_value=0
-            )
-
-            if mask is None:
-                warnings.warn(f"Mask warping failed for camera {cam_num}.")
-                continue
-
-            orig_corner = np.array([[0, 0, 1]], dtype=np.float32).T
-            transformed_corner_h = H_canvas_i @ orig_corner
-            
-            tl_x, tl_y = 0, 0
-            if abs(transformed_corner_h[2, 0]) > 1e-8:
-                tl_x = int(round(transformed_corner_h[0, 0] / transformed_corner_h[2, 0]))
-                tl_y = int(round(transformed_corner_h[1, 0] / transformed_corner_h[2, 0]))
+                print(f"  Processing camera {cam_num}")
+                print(f"    Source image size: {src_w}x{src_h}")
                 
-            warped_images[cam_num] = warped_img
-            masks[cam_num] = mask
-            corners[cam_num] = (tl_x, tl_y)
+                # Warp the image
+                warped_img = cv2.warpPerspective(
+                    img_src_numpy,
+                    H_canvas_i,
+                    (canvas_width, canvas_height),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(0, 0, 0)
+                )
+
+                if warped_img is None:
+                    print(f"    Warping failed for camera {cam_num}")
+                    continue
+
+                # Create and warp the mask
+                mask_src = np.ones((src_h, src_w), dtype=np.uint8) * 255
+                mask = cv2.warpPerspective(
+                    mask_src,
+                    H_canvas_i,
+                    (canvas_width, canvas_height),
+                    flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0
+                )
+
+                if mask is None:
+                    print(f"    Mask warping failed for camera {cam_num}")
+                    continue
+
+                # Calculate corner position
+                orig_corner = np.array([[0, 0, 1]], dtype=np.float32).T
+                transformed_corner_h = H_canvas_i @ orig_corner
+                
+                tl_x, tl_y = 0, 0
+                if abs(transformed_corner_h[2, 0]) > 1e-8:
+                    tl_x = int(round(transformed_corner_h[0, 0] / transformed_corner_h[2, 0]))
+                    tl_y = int(round(transformed_corner_h[1, 0] / transformed_corner_h[2, 0]))
+                
+                print(f"    Warped image size: {warped_img.shape}")
+                print(f"    Corner position: ({tl_x}, {tl_y})")
+                
+                warped_images[cam_num] = warped_img
+                masks[cam_num] = mask
+                corners[cam_num] = (tl_x, tl_y)
+                
+            except Exception as e:
+                print(f"    Error processing camera {cam_num}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue
+                
         return warped_images, masks, corners
     
     def blend_images_opencv(
@@ -992,33 +1100,89 @@ class ImageTransformer:
         canvas_shape: Tuple[int, int],
         camera_order: List[int],
     ) -> Optional[np.ndarray]:
-        """Blends images in a final panormic photo using OpenCV's MultiBandBlender."""
-
-        blender = cv2.detail.MultiBandBlender()
-
-        canvas_h, canvas_w = canvas_shape
-        canvas_rect = (0, 0, canvas_w, canvas_h)
-        blender.prepare(canvas_rect)
-
-        for cam_num in camera_order:
-            img = warped_images.get(cam_num)
-            mask = masks.get(cam_num)
-            corner = corners.get(cam_num)
-            if img is not None and mask is not None and corner is not None:
-                blender.feed(img.astype(np.int16), mask, corner) 
-            else:
-                warnings.warn(f"Skipping feed for Cam {cam_num} - missing data.")
-        result_pano, result_mask = blender.blend(None, None)
-        panorama_final = np.clip(result_pano, 0, 255).astype(np.uint8)
-        return panorama_final
+        """Blends images using alpha blending with masks and removes black borders."""
+        try:
+            canvas_h, canvas_w = canvas_shape
+            # Initialize the final panorama with zeros
+            final_panorama = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
+            # Initialize the weight mask
+            weight_mask = np.zeros((canvas_h, canvas_w), dtype=np.float32)
+            
+            print("\nBlending images...")
+            for cam_num in camera_order:
+                img = warped_images.get(cam_num)
+                mask = masks.get(cam_num)
+                corner = corners.get(cam_num)
+                
+                if img is None or mask is None or corner is None:
+                    print(f"  Skipping camera {cam_num}: Missing data")
+                    continue
+                
+                # print(f"  Processing camera {cam_num}")
+                # print(f"    Image shape: {img.shape}")
+                # print(f"    Mask shape: {mask.shape}")
+                # print(f"    Corner position: {corner}")
+                
+                # Convert mask to float32 and normalize
+                mask_float = mask.astype(np.float32) / 255.0
+                
+                # Convert image to float32
+                img_float = img.astype(np.float32)
+                
+                # Add the weighted image to the panorama
+                for c in range(3):  # For each color channel
+                    final_panorama[:, :, c] += img_float[:, :, c] * mask_float
+                
+                # Update the weight mask
+                weight_mask += mask_float
+            
+            # Avoid division by zero
+            weight_mask = np.maximum(weight_mask, 1e-6)
+            
+            # Normalize the panorama
+            for c in range(3):
+                final_panorama[:, :, c] /= weight_mask
+            
+            # Convert back to uint8
+            panorama_final = np.clip(final_panorama, 0, 255).astype(np.uint8)
+            
+            # Remove black borders
+            gray = cv2.cvtColor(panorama_final, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                # Find the largest contour
+                largest_contour = max(contours, key=cv2.contourArea)
+                x, y, w, h = cv2.boundingRect(largest_contour)
+                
+                # Add some padding
+                padding = 50
+                x = max(0, x - padding)
+                y = max(0, y - padding)
+                w = min(panorama_final.shape[1] - x, w + 2*padding)
+                h = min(panorama_final.shape[0] - y, h + 2*padding)
+                
+                # Crop the image
+                panorama_final = panorama_final[y:y+h, x:x+w]
+            
+            # print("Blending completed successfully")
+            return panorama_final
+            
+        except Exception as e:
+            print(f"Error during blending: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
     
-FAST_THRESHOLD = 30
+FAST_THRESHOLD = 25
 FAST_N = 12
 BRIEF_DESC_SIZE = 256
 BRIEF_PATCH_SIZE = 31
-MATCHER_RATIO_THRESH = 0.75
-RANSAC_ITERATIONS = 1000
-RANSAC_RESIDUAL_THRESH = 3.0
+MATCHER_RATIO_THRESH = 0.8
+RANSAC_ITERATIONS = 3000
+RANSAC_RESIDUAL_THRESH = 2.5
+GLOBAL_SEED = 45
 
 CAMERA_NAMES = [1, 2, 3, 4, 5]
 
@@ -1028,117 +1192,260 @@ ADJACENT_PAIRS = [
     (2, 4),
     (3, 5)
 ]
+
+def liniar_interpolate(image: np.ndarray) -> np.ndarray:
+    for x in range(image.shape[1]):
+        start = 0
+        fin = 0
+        colored = []
+        for y in range(image.shape[0]):
+            r , g, b = image[y, x]
+            if r != 0 or g != 0 or b != 0:
+                if start == 0:
+                    start = y
+                colored.append((r,g,b))
+            else:
+                if start != 0:
+                    fin = y
+                    break
+        # print(start, fin, int(start +  (fin-start)))
+        for y in range(image.shape[0]):
+            position = int(y * (fin-start)/(image.shape[0]))
+            r , g, b = colored[position]
+            image[y,x] = (r,g,b)
+    return image
+
+def stitch_segment(segment_id: str, frame_parser: WaymoFrameParser, timestamp: int, output_dir: Path, frame_index: int, composite_homographies_cache = None, images_semantic = None) -> bool:
+    """
+    Process a single segment and save the stitched panorama.
     
-segment_id = SEGMENT_IDS[-1]
-data = load_waymo_data_from_structure(DATASET_BASE_DIR, segment_id)
-frameParser = WaymoFrameParser(data)
-timestamps = frameParser.get_timestamps()
-
-target_timestamp = timestamps[0]
-frame_images = frameParser.get_timestamp_images(target_timestamp)
-
-fast_detector = FASTPCornerDetection(t=FAST_THRESHOLD, n=FAST_N)
-brief_descriptor = BRIEFDescriptor(descriptor_size=BRIEF_DESC_SIZE, patch_size=BRIEF_PATCH_SIZE)
-feature_matcher = FeatureMatcher(ratio_threshold=MATCHER_RATIO_THRESH)
-ransac_homography = RANSACHomography(num_iterations=RANSAC_ITERATIONS, inlier_threshold=RANSAC_RESIDUAL_THRESH)
-image_transformer = ImageTransformer()
-
-all_valid_keypoints = {}
-all_descriptors = {}
-image_shapes = {}
-camera_to_image = {}
-
-print("COMPUTING DESCRIPTORS")
-
-for camera in CAMERA_NAMES:
-    if camera in frame_images:
-        image = frame_images[camera]
-        scale_percent = 50 # example: 50%
-        new_width = int(image.width * scale_percent / 100)
-        new_height = int(image.height * scale_percent / 100)
-        image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        image_shapes[camera] = (image.height, image.width)
-        camera_to_image[camera] = image
-        print(f"Camera {camera}: {image.size}")
-        grayscale_image = image.convert("L")
-        image_array = np.array(grayscale_image, dtype=np.int16) 
-        keypoints = fast_detector.detect_corners(image)
-        keypoint_coords = list(zip(*np.where(keypoints))) 
-        valid_keypoints, descriptors = brief_descriptor.compute(image_array, keypoint_coords)
-        if descriptors is not None and len(valid_keypoints) > 0:
-            all_valid_keypoints[camera] = valid_keypoints
-            all_descriptors[camera] = descriptors
-    else:
-        print(f"Camera {camera}: No image data available.")
+    Args:
+        segment_id: The ID of the segment to process
+        frame_parser: The WaymoFrameParser instance
+        timestamp: The timestamp to process
+        output_dir: Directory to save the results
+        frame_index: The index of the frame being processed (1-based)
         
-print("COMPUTING HOMOGRAPHIES")
-        
-adjacent_homographies = {}
-for target_camera, source_camera in ADJACENT_PAIRS:
-    if target_camera not in all_descriptors or source_camera not in all_descriptors:
-        print(f"Skipping pair ({target_camera}, {source_camera}) due to missing descriptors.")
-        adjacent_homographies[(target_camera, source_camera)] = None
-        continue
-    matches = feature_matcher.match(all_descriptors[source_camera], all_descriptors[target_camera])
-    print(f"Found {len(matches)} matches for {target_camera}, {source_camera}.")
-    if len(matches) < ransac_homography.min_samples:
-        print(f"Skipping pair: Not enough matches ({len(matches)}) found for homography (need >= {ransac_homography.min_samples}).")
-        adjacent_homographies[(target_camera, source_camera)] = None
-        continue
-    H_target_from_source, inlier_mask = ransac_homography.get_homography(
-        all_valid_keypoints[source_camera],
-        all_valid_keypoints[target_camera],
-        matches
-    )
-    adjacent_homographies[(target_camera, source_camera)] = (H_target_from_source, inlier_mask) 
-    if H_target_from_source is None:
-        print(f"Failed to compute homography for pair ({target_camera}, {source_camera}).")
-        continue
-    
-composite_homographies = image_transformer.calculate_composite_homographies(adjacent_homographies, CAMERA_NAMES, ref_cam_num=1)
-if composite_homographies is None:
-    print("Failed to compute composite homographies.")
-    
-canvas_result = image_transformer.calculate_canvas_geometry(composite_homographies, image_shapes, CAMERA_NAMES)
-if not canvas_result: 
-    print("Error: Failed to calculate canvas geometry. Stopping.")
-    exit(1)
-canvas_shape, canvas_offset = canvas_result
-
-final_homographies = image_transformer.adjust_homographies_for_canvas(composite_homographies, canvas_offset)
-
-warped_images, masks, corners = image_transformer.warp_images_and_create_masks(
-        camera_to_image,
-        final_homographies,
-        canvas_shape,
-        CAMERA_NAMES,
-)
-
-camera_order = sorted(CAMERA_NAMES)
-final_panorama = image_transformer.blend_images_opencv(
-        warped_images,
-        masks,
-        corners,
-        canvas_shape,
-        camera_order
-)
-
-# --- Display Final Result ---
-if final_panorama is not None:
-    print("\n--- Final Panorama Generated ---")
-    output_filename = f"final_panorama_{segment_id}_{target_timestamp}_multiband.png"
+    Returns:
+        bool: True if processing was successful, False otherwise
+    """
     try:
-        cv2.imwrite(output_filename, final_panorama)
-        print(f"Final panorama saved to: {output_filename}")
+        # print(f"\nProcessing segment: {segment_id}, frame {frame_index}")
+        if images_semantic is None:
+            frame_images = frame_parser.get_timestamp_images(timestamp)
+        else:
+            frame_images = images_semantic
+        if not frame_images:
+            print(f"No images found for segment {segment_id} at timestamp {timestamp}")
+            return False
+        # IMAGE_SAVED_DIR = ".\\input_images"
+        # Initialize feature detection and matching components
+        fast_detector = FASTPCornerDetection(t=FAST_THRESHOLD, n=FAST_N)
+        brief_descriptor = BRIEFDescriptor(descriptor_size=BRIEF_DESC_SIZE, patch_size=BRIEF_PATCH_SIZE, seed=GLOBAL_SEED)
+        feature_matcher = FeatureMatcher(ratio_threshold=MATCHER_RATIO_THRESH)
+        ransac_homography = RANSACHomography(num_iterations=RANSAC_ITERATIONS, inlier_threshold=RANSAC_RESIDUAL_THRESH, seed=GLOBAL_SEED)
+        image_transformer = ImageTransformer()
 
-        plt.figure(figsize=(20, 10))
-        plt.imshow(cv2.cvtColor(final_panorama, cv2.COLOR_BGR2RGB))
-        plt.title(f"Final Stitched Panorama (Cam Ref 1, multiband blend)")
-        plt.axis('off')
-        plt.show()
+        all_valid_keypoints = {}
+        all_descriptors = {}
+        image_shapes = {}
+        camera_to_image = {}
+
+        # print("COMPUTING DESCRIPTORS")
+        for camera in CAMERA_NAMES:
+            if camera in frame_images:
+                image = frame_images[camera]
+                scale_percent = 50
+                new_width = int(image.width * scale_percent / 100)
+                new_height = int(image.height * scale_percent / 100)
+                image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                image_shapes[camera] = (image.height, image.width)
+                camera_to_image[camera] = image
+                # print(f"Camera {camera}: {image.size}")
+                if composite_homographies_cache is None:
+                    grayscale_image = image.convert("L")
+                    image_array = np.array(grayscale_image, dtype=np.int16) 
+                    keypoints = fast_detector.detect_corners(image)
+                    keypoint_coords = list(zip(*np.where(keypoints))) 
+                    valid_keypoints, descriptors = brief_descriptor.compute(image_array, keypoint_coords)
+                    if descriptors is not None and len(valid_keypoints) > 0:
+                        all_valid_keypoints[camera] = valid_keypoints
+                        all_descriptors[camera] = descriptors
+            else:
+                print(f"Camera {camera}: No image data available.")
+
+        
+        if composite_homographies_cache is None:
+            # print("COMPUTING HOMOGRAPHIES")
+            adjacent_homographies = {}
+            for target_camera, source_camera in ADJACENT_PAIRS:
+                if target_camera not in all_descriptors or source_camera not in all_descriptors:
+                    print(f"Skipping pair ({target_camera}, {source_camera}) due to missing descriptors.")
+                    adjacent_homographies[(target_camera, source_camera)] = None
+                    continue
+                matches = feature_matcher.match(all_descriptors[source_camera], all_descriptors[target_camera])
+                # print(f"Found {len(matches)} matches for {target_camera}, {source_camera}.")
+                if len(matches) < ransac_homography.min_samples:
+                    print(f"Skipping pair: Not enough matches ({len(matches)}) found for homography (need >= {ransac_homography.min_samples}).")
+                    adjacent_homographies[(target_camera, source_camera)] = None
+                    continue
+                H_target_from_source, inlier_mask = ransac_homography.get_homography(
+                    all_valid_keypoints[source_camera],
+                    all_valid_keypoints[target_camera],
+                    matches
+                )
+                adjacent_homographies[(target_camera, source_camera)] = (H_target_from_source, inlier_mask) 
+                if H_target_from_source is None:
+                    print(f"Failed to compute homography for pair ({target_camera}, {source_camera}).")
+                    continue
+
+            composite_homographies = image_transformer.calculate_composite_homographies(adjacent_homographies, CAMERA_NAMES, ref_cam_num=1)
+            if composite_homographies is None:
+                print("Failed to compute composite homographies.")
+                return False
+            else:
+                composite_homographies_cache = composite_homographies
+        else:
+            composite_homographies = composite_homographies_cache
+        canvas_result = image_transformer.calculate_canvas_geometry(composite_homographies, image_shapes, CAMERA_NAMES)
+        if not canvas_result: 
+            print("Error: Failed to calculate canvas geometry.")
+            return False
+        canvas_shape, canvas_offset = canvas_result
+
+        final_homographies = image_transformer.adjust_homographies_for_canvas(composite_homographies, canvas_offset)
+
+        warped_images, masks, corners = image_transformer.warp_images_and_create_masks(
+            camera_to_image,
+            final_homographies,
+            canvas_shape,
+            CAMERA_NAMES,
+        )
+
+        camera_order = [4, 2, 1, 3, 5]
+        final_panorama = image_transformer.blend_images_opencv(
+            warped_images,
+            masks,
+            corners,
+            canvas_shape,
+            camera_order
+        )
+
+        if final_panorama is not None:
+            # print(type(final_panorama))       # Should print: <class 'numpy.ndarray'>
+            # print(final_panorama.shape)       # (Height, Width) for grayscale or (Height, Width, 3) for RGB
+            # print(final_panorama.dtype)       # e.g., uint8, float32
+            # final_panorama = liniar_interpolate(final_panorama)
+            output_filename = output_dir / f"panorama_{segment_id}_frame{frame_index}.png"
+            cv2.imwrite(str(output_filename), final_panorama)
+            # print(f"Panorama saved to: {output_filename}")
+            return True, composite_homographies_cache
+        else:
+            print("Failed to generate final panorama.")
+            return False
+
     except Exception as e:
-        print(f"Error saving or displaying final panorama: {e}")
-else:
-    print("\n--- Final Panorama Generation Failed ---")
+        print(f"Error processing segment {segment_id}, frame {frame_index}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
 
+def main(limit: int):
+    composite_homographies_cache = None
+    i_limit = 0
+    for TARGET_SEGMENT_INDEX in SEGMENT_IDS[::-1]:
+        i_limit+=1
+        if i_limit > limit:
+            break
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_dir = Path("results") 
+        results_dir.mkdir(parents=True, exist_ok=True)
+        # TARGET_SEGMENT_INDEX = SEGMENT_IDS[-1]
+        NUM_FRAMES = float('inf') 
+        
+        if TARGET_SEGMENT_INDEX not in SEGMENT_IDS:
+            print(f"Error: Segment {TARGET_SEGMENT_INDEX} not found in available segments")
+            return
+            
+        print(f"\nProcessing segment: {TARGET_SEGMENT_INDEX}")
+        
+        data = load_waymo_data_from_structure(DATASET_BASE_DIR, TARGET_SEGMENT_INDEX)
+        if data is None:
+            print(f"Failed to load data for segment {TARGET_SEGMENT_INDEX}")
+            return
+            
+        frame_parser = WaymoFrameParser(data)
+        timestamps = frame_parser.get_timestamps()
+        if not timestamps:
+            print(f"No timestamps found for segment {TARGET_SEGMENT_INDEX}")
+            return
+        
+        num_frames_to_process = min(NUM_FRAMES, len(timestamps))
+        print(f"Processing {num_frames_to_process} frames from segment {TARGET_SEGMENT_INDEX}")
+        for i, timestamp in enumerate(timestamps[:num_frames_to_process], 1):
+            if i_limit > limit:
+                break
+            i_limit+=1
+            print(f"\nProcessing frame {i} of {num_frames_to_process}")
+            success, composite_homographies_cache = stitch_segment(TARGET_SEGMENT_INDEX, frame_parser, timestamp, results_dir, i, composite_homographies_cache)
+            if success:
+                print(f"Successfully processed frame {i}")
+            else:
+                print(f"Failed to process frame {i}")
+    return composite_homographies_cache
+
+
+from semantic import generate_colorized_waymo_frames
+
+
+def main_semantic(composite_homographies_cache):
+    SEMANTIC_PANORAMA_DIR = "semantic_results"
+    CAMERA_IMAGE_DATASET_PATH = 'dataset/camera_image' 
+    # Path to the directory containing camera segmentation parquet files
+    CAMERA_SEGMENTATION_DATASET_PATH = 'dataset/semantic/camera_segmentation'
+    # Iterate through the generator
+    frame_counter = 0
+    for frame_data in generate_colorized_waymo_frames(
+        CAMERA_IMAGE_DATASET_PATH,
+        CAMERA_SEGMENTATION_DATASET_PATH,
+        alpha=0.6 # Adjust transparency as needed
+    ):
+        print(f"\nProcessing frame: Segment={frame_data['segment_context_name']}, Timestamp={frame_data['frame_timestamp_micros']}")
+        
+        # Access the 5 images for this timestamp
+        camera_images = frame_data['camera_images']
+        
+        # Example: Save each of the 5 images to disk
+        images_semantic = {}
+        for camera_name, img_pil in camera_images.items():
+            # output_filename = os.path.join(
+            #     OUTPUT_COLORIZED_IMAGES_PATH,
+            #     f"{frame_data['segment_context_name']}_{frame_data['frame_timestamp_micros']}_{camera_name}_overlay.jpg"
+            # )
+            if camera_name == "SIDE_LEFT":
+                cn = 4
+            elif camera_name == "FRONT_LEFT":
+                cn = 2
+            elif camera_name == "FRONT":
+                cn = 1
+            elif camera_name == "FRONT_RIGHT":
+                cn = 3
+            else:
+                cn = 5
+            images_semantic[cn] = img_pil
+        success, composite_homographies_cache = stitch_segment("0", None, 1, Path(SEMANTIC_PANORAMA_DIR), frame_counter, composite_homographies_cache, images_semantic)
+        frame_counter += 1
+        # Optional: Stop after processing a few frames for demonstration
+        # if frame_counter >= 2: # Uncomment and adjust to process only a few frames
+        #     print("Processed 2 full frames. Stopping example usage.")
+        #     break
+
+    if frame_counter == 0:
+        print("No complete frames (5 cameras with overlays) were generated.")
+    else:
+        print(f"\nFinished processing. Total {frame_counter} complete frames (sets of 5 camera images) generated and saved.")
+
+if __name__ == "__main__":
+    composite_homographies_cache = main(1)
+    main_semantic(composite_homographies_cache)
 
