@@ -18,19 +18,17 @@ def create_ffmpeg_video_from_images(image_folder, output_video="stitched_panoram
     key=lambda p: (get_first_number(p.name),len(p.name))
     )  
     if not image_paths:
-        print("❌ No panorama images found in folder.")
+        print("No panorama images found in folder.")
         return
 
     list_file = image_folder / "images.txt"
 
-    # Write image filenames (relative) to file
     with open(list_file, "w") as f:
         for path in image_paths:
             f.write(f"file '{path.name}'\n")
 
-    print(f"📄 Created {list_file} with {len(image_paths)} entries.")
+    print(f"Created {list_file} with {len(image_paths)} entries.")
 
-    # Full output path
     output_path = Path.cwd() / output_video
 
     command = [
@@ -45,17 +43,17 @@ def create_ffmpeg_video_from_images(image_folder, output_video="stitched_panoram
     str(output_path)
 ]
 
-    print(f"▶️ Running FFmpeg from folder: {image_folder}")
+    print(f"Running FFmpeg from folder: {image_folder}")
     result = subprocess.run(command, cwd=str(image_folder))
 
     if cleanup and list_file.exists():
         list_file.unlink()
-        print(f"🧹 Removed temporary file: {list_file}")
+        print(f"Removed temporary file: {list_file}")
 
     if result.returncode == 0:
-        print(f"✅ Video created successfully: {output_path}")
+        print(f"Video created successfully: {output_path}")
     else:
-        print(f"❌ FFmpeg failed with return code {result.returncode}")
+        print(f"FFmpeg failed with return code {result.returncode}")
 
 if __name__ == "__main__":
     create_ffmpeg_video_from_images("semantic_results", "stitched_panorama_semantic.mp4", fps=12, cleanup=True)

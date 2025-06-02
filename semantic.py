@@ -7,36 +7,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-# --- Configuration ---
-# Path to the directory containing camera image parquet files
+
 CAMERA_IMAGE_DATASET_PATH = 'dataset/camera_image' 
-# Path to the directory containing camera segmentation parquet files
 CAMERA_SEGMENTATION_DATASET_PATH = 'dataset/semantic/camera_segmentation'
-# Output folder for the colorized images (optional, for saving during generation)
 OUTPUT_COLORIZED_IMAGES_PATH = 'colorized_segmentation_overlays'
 
-# Waymo camera name to integer ID mapping (common in Waymo Open Dataset)
-# Verify these against your specific dataset's 'key.camera_name' values.
-# If your 'key.camera_name' column contains strings like 'FRONT', 'FRONT_LEFT', etc.,
-# you'll need to adjust the script to use those strings directly or map them to integers.
-# Based on Waymo's proto definitions, these are typical integer values.
 CAMERA_NAMES_MAP = {
-    # 0: 'UNKNOWN', # Often 0 is UNKNOWN. Waymo's cameras are typically 1-indexed.
     1: 'FRONT',
     2: 'FRONT_LEFT',
     3: 'FRONT_RIGHT',
     4: 'SIDE_LEFT',
     5: 'SIDE_RIGHT',
 }
-# List of camera IDs we expect for a complete timestamp
-EXPECTED_CAMERA_IDS = [1, 2, 3, 4, 5] # Assuming FRONT, FRONT_LEFT, FRONT_RIGHT, SIDE_LEFT, SIDE_RIGHT
 
-# Waymo semantic mapping for panoptic labels (simplified example)
-# THIS IS A PLACEHOLDER. You MUST replace this with the official Waymo semantic ID mapping
-# and their corresponding RGB colors for accurate visualization.
-# Refer to Waymo Open Dataset documentation or their provided utilities for the full list.
-# Example: https://github.com/waymo-research/waymo-open-dataset/blob/master/waymo_open_dataset/protos/segmentation.proto
-# Search for 'SemanticLabel' enum and associated color maps.
+EXPECTED_CAMERA_IDS = [1, 2, 3, 4, 5]
+
+
 WAYMO_SEMANTIC_COLORS = {
     0: (0, 0, 0),       # Unlabeled / Background (Black)
     1: (128, 64, 128),  # Road (Purple)
@@ -64,8 +50,6 @@ WAYMO_SEMANTIC_COLORS = {
     # ... add all 28+ classes from Waymo's definition
 }
 
-
-# --- Helper Function for Colorizing Masks ---
 def colorize_mask(panoptic_mask_array, panoptic_label_divisor, semantic_colors):
     """
     Converts a panoptic mask array into a colorized semantic segmentation mask.
@@ -81,14 +65,12 @@ def colorize_mask(panoptic_mask_array, panoptic_label_divisor, semantic_colors):
     height, width = panoptic_mask_array.shape
     colored_mask = np.zeros((height, width, 3), dtype=np.uint8)
 
-    # Decode semantic ID from panoptic label
     semantic_ids = panoptic_mask_array // panoptic_label_divisor
 
     unique_semantic_ids = np.unique(semantic_ids)
 
     for sem_id in unique_semantic_ids:
-        color = semantic_colors.get(sem_id, (0, 0, 0)) # Default to black for unknown IDs
-        # Apply color to all pixels belonging to this semantic ID
+        color = semantic_colors.get(sem_id, (0, 0, 0))
         colored_mask[semantic_ids == sem_id] = color
 
     return colored_mask
@@ -96,7 +78,7 @@ def colorize_mask(panoptic_mask_array, panoptic_label_divisor, semantic_colors):
 def generate_colorized_waymo_frames(
     camera_image_dir,
     segmentation_dir,
-    alpha=0.5 # Transparency level for the mask overlay
+    alpha=0.5
 ):
     """
     A generator function that yields a dictionary for each unique timestamp
@@ -116,14 +98,13 @@ def generate_colorized_waymo_frames(
                                     and values are PIL Image objects of the overlaid image.
     """
     
-    # 1. Load all camera image data for efficient lookup
     print("Loading all camera image data for lookup...")
     camera_images_dfs = []
     camera_image_files = [f for f in os.listdir(camera_image_dir) if f.endswith('.parquet')]
     
     if not camera_image_files:
         print(f"No camera image parquet files found in {camera_image_dir}. Cannot generate frames.")
-        return # Exit generator if no image data
+        return
 
     for file_name in camera_image_files:
         file_path = os.path.join(camera_image_dir, file_name)
@@ -136,13 +117,12 @@ def generate_colorized_waymo_frames(
     all_camera_images_df = pd.concat(camera_images_dfs, ignore_index=True)
     print(f"Loaded {len(all_camera_images_df)} camera image entries.")
 
-    # 2. Process Segmentation Data file by file
     print("Processing segmentation data and yielding colorized frames...")
     segmentation_parquet_files = [f for f in os.listdir(segmentation_dir) if f.endswith('.parquet')]
     
     if not segmentation_parquet_files:
         print(f"No segmentation parquet files found in {segmentation_dir}. Cannot generate frames.")
-        return # Exit generator if no segmentation data
+        return
 
     for seg_file_name in segmentation_parquet_files:
         seg_file_path = os.path.join(segmentation_dir, seg_file_name)
@@ -152,20 +132,17 @@ def generate_colorized_waymo_frames(
             seg_table = pq.read_table(seg_file_path)
             seg_df = seg_table.to_pandas()
 
-            # Column names for segmentation masks and identifiers
             mask_bytes_col = '[CameraSegmentationLabelComponent].panoptic_label'
             divisor_col = '[CameraSegmentationLabelComponent].panoptic_label_divisor'
             camera_name_col = 'key.camera_name'
             timestamp_col = 'key.frame_timestamp_micros'
             segment_context_col = 'key.segment_context_name'
-            # IMPORTANT: Verify this column name in your actual camera_image parquet files!
             original_image_bytes_col = '[CameraImageComponent].image' 
 
             if mask_bytes_col not in seg_df.columns or divisor_col not in seg_df.columns:
                 print(f"Required segmentation columns not found in {seg_file_name}. Skipping this file.")
                 continue
             
-            # Group by segment context and timestamp to get all 5 cameras for a frame
             grouped_frames = seg_df.groupby([segment_context_col, timestamp_col])
 
             for (segment_context, timestamp), frame_group in grouped_frames:
@@ -175,7 +152,6 @@ def generate_colorized_waymo_frames(
                     'camera_images': {}
                 }
                 
-                # Assume all cameras are present until proven otherwise
                 all_cameras_present_and_processed = True 
                 
                 for camera_id in EXPECTED_CAMERA_IDS:
@@ -183,10 +159,8 @@ def generate_colorized_waymo_frames(
                     
                     if seg_row_for_camera.empty:
                         all_cameras_present_and_processed = False
-                        # print(f"Missing segmentation data for camera {CAMERA_NAMES_MAP.get(camera_id, camera_id)} at timestamp {timestamp} in segment {segment_context}.")
-                        break # Skip this timestamp if any camera's segmentation is missing
+                        break
 
-                    # Find the corresponding original image
                     matching_image_row = all_camera_images_df[
                         (all_camera_images_df[segment_context_col] == segment_context) &
                         (all_camera_images_df[timestamp_col] == timestamp) &
@@ -195,39 +169,30 @@ def generate_colorized_waymo_frames(
 
                     if matching_image_row.empty:
                         all_cameras_present_and_processed = False
-                        # print(f"Missing original image for camera {CAMERA_NAMES_MAP.get(camera_id, camera_id)} at timestamp {timestamp} in segment {segment_context}.")
-                        break # Skip this timestamp if any camera's original image is missing
+                        break
                     
                     if original_image_bytes_col not in matching_image_row.columns:
                         print(f"'{original_image_bytes_col}' not found in camera image dataframe. Please check column name in camera_image parquet files. Aborting processing of this file.")
                         all_cameras_present_and_processed = False
-                        break # Critical error, cannot proceed with this file
+                        break
 
-                    # Extract data for this camera
                     seg_row = seg_row_for_camera.iloc[0]
                     original_image_bytes = matching_image_row.iloc[0][original_image_bytes_col]
                     panoptic_mask_bytes = seg_row[mask_bytes_col]
                     panoptic_label_divisor = seg_row[divisor_col]
 
                     try:
-                        # Load original image
                         original_image = Image.open(io.BytesIO(original_image_bytes)).convert("RGB")
                         original_image_np = np.array(original_image)
 
-                        # Load panoptic mask
-                        panoptic_mask = Image.open(io.BytesIO(panoptic_mask_bytes)).convert("I") # 'I' for integer pixels
+                        panoptic_mask = Image.open(io.BytesIO(panoptic_mask_bytes)).convert("I")
                         panoptic_mask_np = np.array(panoptic_mask)
 
-                        # Ensure mask and image dimensions match
                         if original_image_np.shape[:2] != panoptic_mask_np.shape[:2]:
-                            # Resize mask to match image using NEAREST neighbor to preserve integer labels
                             panoptic_mask_np = np.array(panoptic_mask.resize(original_image.size, Image.NEAREST))
-                            # print(f"Warning: Mask and image dimensions mismatch. Resizing mask for {segment_context}_{timestamp}_{CAMERA_NAMES_MAP.get(camera_id, camera_id)}.")
 
-                        # Colorize the panoptic mask
                         colored_semantic_mask = colorize_mask(panoptic_mask_np, panoptic_label_divisor, WAYMO_SEMANTIC_COLORS)
 
-                        # Blending: (1 - alpha) * original_image + alpha * colored_mask
                         original_image_float = original_image_np.astype(np.float32) / 255.0
                         colored_mask_float = colored_semantic_mask.astype(np.float32) / 255.0
 
@@ -240,9 +205,8 @@ def generate_colorized_waymo_frames(
                     except Exception as e:
                         print(f"Error processing overlay for segment {segment_context}, timestamp {timestamp}, camera {CAMERA_NAMES_MAP.get(camera_id, camera_id)}: {e}")
                         all_cameras_present_and_processed = False
-                        break # Skip this timestamp if there's an error with one camera
+                        break
 
-                # Yield the complete frame if all cameras were successfully processed
                 if all_cameras_present_and_processed and len(current_frame_overlays['camera_images']) == len(EXPECTED_CAMERA_IDS):
                     yield current_frame_overlays
                 else:
@@ -253,36 +217,31 @@ def generate_colorized_waymo_frames(
 
 
 if __name__ == "__main__":
-    # Create output directory for saving example frames
     os.makedirs(OUTPUT_COLORIZED_IMAGES_PATH, exist_ok=True)
 
-    # Iterate through the generator
     frame_counter = 0
     for frame_data in generate_colorized_waymo_frames(
         CAMERA_IMAGE_DATASET_PATH,
         CAMERA_SEGMENTATION_DATASET_PATH,
-        alpha=0.6 # Adjust transparency as needed
+        alpha=0.6
     ):
         print(f"\nProcessing frame: Segment={frame_data['segment_context_name']}, Timestamp={frame_data['frame_timestamp_micros']}")
         
-        # Access the 5 images for this timestamp
         camera_images = frame_data['camera_images']
         
-        # Example: Save each of the 5 images to disk
         for camera_name, img_pil in camera_images.items():
             output_filename = os.path.join(
                 OUTPUT_COLORIZED_IMAGES_PATH,
                 f"{frame_data['segment_context_name']}_{frame_data['frame_timestamp_micros']}_{camera_name}_overlay.jpg"
             )
             print(camera_name)
-            img_pil.save(output_filename, quality=90) # Save as JPEG with good quality
+            img_pil.save(output_filename, quality=90)
             print(f"Saved {output_filename}")
         
         frame_counter += 1
-        # Optional: Stop after processing a few frames for demonstration
-        # if frame_counter >= 2: # Uncomment and adjust to process only a few frames
-        #     print("Processed 2 full frames. Stopping example usage.")
-        #     break
+        if frame_counter >= 2:
+            print("Processed 2 full frames. Stopping example usage.")
+            break
 
     if frame_counter == 0:
         print("No complete frames (5 cameras with overlays) were generated.")

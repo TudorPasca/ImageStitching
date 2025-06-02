@@ -654,22 +654,6 @@ class RANSACHomography:
                     best_inlier_mask = inlier_mask
             except Exception:
                  continue
-             
-        # if best_H is not None and np.sum(best_inlier_mask) > self.min_samples:
-        #     all_inlier_pts1 = pts1[best_inlier_mask]
-        #     all_inlier_pts2 = pts2[best_inlier_mask]
-        #     try:
-        #         # Re-estimate H using all inliers from the best model
-        #         refined_H = self._compute_homography_dlt(all_inlier_pts1, all_inlier_pts2)
-        #         if refined_H is not None:
-        #             # You might want to ensure the refined_H doesn't drastically increase error,
-        #             # but usually, it's better or very similar for the inlier set.
-        #             best_H = refined_H
-        #     except ValueError: # SVD can fail if inliers are degenerate
-        #         pass # Keep the original best_H from the minimal sample
-        #     except Exception as e:
-        #         print(f"Warning: Error during homography refinement: {e}") # Keep original best_H
-        #         pass
 
         return best_H, best_inlier_mask
     
@@ -800,14 +784,6 @@ class ImageTransformer:
                         print(f"  Using path through camera 3 for camera {cam_num}")
                         continue
 
-            # # For camera 5, try a more direct approach if the indirect path failed
-            # if cam_num == 5 and (ref_cam_num, 5) in all_available_H:
-            #     H = all_available_H[(ref_cam_num, 5)]
-            #     if np.sign(H[0, 2]) > 0:  # Check if it moves right
-            #         composite_H[cam_num] = H
-            #         print(f"  Using direct homography for camera {cam_num} (relaxed validation)")
-            #         continue
-
             print(f"  Warning: Could not find valid homography for camera {cam_num}")
 
         if len(composite_H) != len(all_cam_nums):
@@ -842,12 +818,10 @@ class ImageTransformer:
                     if np.sign(translation[0]) != np.sign(expected_x):
                         return False
             
-            # Much more lenient vertical translation check for cameras 4 and 5
             max_vertical = 1200 if expected_x in [-2, 2] else 800  # Increased for outer cameras
             if abs(translation[1]) > max_vertical:
                 return False
             
-            # More lenient threshold for outer cameras
             max_translation = 6000 if abs(expected_x) == 2 else 4000  # Increased for outer cameras
             if np.any(np.abs(translation) > max_translation):
                 return False
@@ -865,7 +839,6 @@ class ImageTransformer:
     ) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
         """
         Calculates the required canvas size and offset to fit all transformed images.
-        Now uses a more compact approach to minimize black space.
         """
         all_transformed_corners = []
 
@@ -907,27 +880,22 @@ class ImageTransformer:
         min_coords = np.min(all_corners_np, axis=0)
         max_coords = np.max(all_corners_np, axis=0)
         
-        # Calculate dimensions with padding
-        padding = 200  # Add padding to prevent edge clipping
+        padding = 200
         width = max_coords[0] - min_coords[0] + 2 * padding
         height = max_coords[1] - min_coords[1] + 2 * padding
 
-        # Ensure minimum size
         min_size = 2000
         if width < min_size:
             width = min_size
         if height < min_size:
             height = min_size
 
-        # Scale down if the canvas is too large
-        max_dimension = 6000  # Increased from 4000
+        max_dimension = 6000
         if width > max_dimension or height > max_dimension:
             scale_factor = max_dimension / max(width, height)
             width = int(width * scale_factor)
             height = int(height * scale_factor)
 
-        # Calculate offset to center the content
-        # First, find the center of the reference camera (camera 1)
         ref_cam_corners = None
         for cam_num in camera_names:
             if cam_num == 1 and cam_num in composite_H and composite_H[cam_num] is not None:
@@ -950,12 +918,10 @@ class ImageTransformer:
                 break
 
         if ref_cam_corners is not None:
-            # Use the reference camera's center as the anchor point
             ref_center = np.mean(ref_cam_corners, axis=0)
             offset_x = int(width/2 - ref_center[0])
             offset_y = int(height/2 - ref_center[1])
         else:
-            # Fallback to using the center of all corners
             center_x = (min_coords[0] + max_coords[0]) / 2
             center_y = (min_coords[1] + max_coords[1]) / 2
             offset_x = int(width/2 - center_x)
@@ -1039,7 +1005,6 @@ class ImageTransformer:
                 print(f"  Processing camera {cam_num}")
                 print(f"    Source image size: {src_w}x{src_h}")
                 
-                # Warp the image
                 warped_img = cv2.warpPerspective(
                     img_src_numpy,
                     H_canvas_i,
@@ -1053,7 +1018,6 @@ class ImageTransformer:
                     print(f"    Warping failed for camera {cam_num}")
                     continue
 
-                # Create and warp the mask
                 mask_src = np.ones((src_h, src_w), dtype=np.uint8) * 255
                 mask = cv2.warpPerspective(
                     mask_src,
@@ -1068,7 +1032,6 @@ class ImageTransformer:
                     print(f"    Mask warping failed for camera {cam_num}")
                     continue
 
-                # Calculate corner position
                 orig_corner = np.array([[0, 0, 1]], dtype=np.float32).T
                 transformed_corner_h = H_canvas_i @ orig_corner
                 
@@ -1103,9 +1066,7 @@ class ImageTransformer:
         """Blends images using alpha blending with masks and removes black borders."""
         try:
             canvas_h, canvas_w = canvas_shape
-            # Initialize the final panorama with zeros
             final_panorama = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
-            # Initialize the weight mask
             weight_mask = np.zeros((canvas_h, canvas_w), dtype=np.float32)
             
             print("\nBlending images...")
@@ -1123,50 +1084,33 @@ class ImageTransformer:
                 # print(f"    Mask shape: {mask.shape}")
                 # print(f"    Corner position: {corner}")
                 
-                # Convert mask to float32 and normalize
                 mask_float = mask.astype(np.float32) / 255.0
-                
-                # Convert image to float32
                 img_float = img.astype(np.float32)
-                
-                # Add the weighted image to the panorama
-                for c in range(3):  # For each color channel
+                for c in range(3):
                     final_panorama[:, :, c] += img_float[:, :, c] * mask_float
-                
-                # Update the weight mask
                 weight_mask += mask_float
             
-            # Avoid division by zero
             weight_mask = np.maximum(weight_mask, 1e-6)
             
-            # Normalize the panorama
             for c in range(3):
                 final_panorama[:, :, c] /= weight_mask
             
-            # Convert back to uint8
             panorama_final = np.clip(final_panorama, 0, 255).astype(np.uint8)
             
-            # Remove black borders
             gray = cv2.cvtColor(panorama_final, cv2.COLOR_BGR2GRAY)
             _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             if contours:
-                # Find the largest contour
                 largest_contour = max(contours, key=cv2.contourArea)
                 x, y, w, h = cv2.boundingRect(largest_contour)
-                
-                # Add some padding
                 padding = 50
                 x = max(0, x - padding)
                 y = max(0, y - padding)
                 w = min(panorama_final.shape[1] - x, w + 2*padding)
                 h = min(panorama_final.shape[0] - y, h + 2*padding)
-                
-                # Crop the image
                 panorama_final = panorama_final[y:y+h, x:x+w]
             
-            # print("Blending completed successfully")
             return panorama_final
             
         except Exception as e:
@@ -1332,13 +1276,8 @@ def stitch_segment(segment_id: str, frame_parser: WaymoFrameParser, timestamp: i
         )
 
         if final_panorama is not None:
-            # print(type(final_panorama))       # Should print: <class 'numpy.ndarray'>
-            # print(final_panorama.shape)       # (Height, Width) for grayscale or (Height, Width, 3) for RGB
-            # print(final_panorama.dtype)       # e.g., uint8, float32
-            # final_panorama = liniar_interpolate(final_panorama)
             output_filename = output_dir / f"panorama_{segment_id}_frame{frame_index}.png"
             cv2.imwrite(str(output_filename), final_panorama)
-            # print(f"Panorama saved to: {output_filename}")
             return True, composite_homographies_cache
         else:
             print("Failed to generate final panorama.")
@@ -1360,7 +1299,6 @@ def main(limit: int):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         results_dir = Path("results") 
         results_dir.mkdir(parents=True, exist_ok=True)
-        # TARGET_SEGMENT_INDEX = SEGMENT_IDS[-1]
         NUM_FRAMES = float('inf') 
         
         if TARGET_SEGMENT_INDEX not in SEGMENT_IDS:
@@ -1401,27 +1339,19 @@ from semantic import generate_colorized_waymo_frames
 def main_semantic(composite_homographies_cache):
     SEMANTIC_PANORAMA_DIR = "semantic_results"
     CAMERA_IMAGE_DATASET_PATH = 'dataset/camera_image' 
-    # Path to the directory containing camera segmentation parquet files
     CAMERA_SEGMENTATION_DATASET_PATH = 'dataset/semantic/camera_segmentation'
-    # Iterate through the generator
     frame_counter = 0
     for frame_data in generate_colorized_waymo_frames(
         CAMERA_IMAGE_DATASET_PATH,
         CAMERA_SEGMENTATION_DATASET_PATH,
-        alpha=0.6 # Adjust transparency as needed
+        alpha=0.6
     ):
         print(f"\nProcessing frame: Segment={frame_data['segment_context_name']}, Timestamp={frame_data['frame_timestamp_micros']}")
         
-        # Access the 5 images for this timestamp
         camera_images = frame_data['camera_images']
         
-        # Example: Save each of the 5 images to disk
         images_semantic = {}
         for camera_name, img_pil in camera_images.items():
-            # output_filename = os.path.join(
-            #     OUTPUT_COLORIZED_IMAGES_PATH,
-            #     f"{frame_data['segment_context_name']}_{frame_data['frame_timestamp_micros']}_{camera_name}_overlay.jpg"
-            # )
             if camera_name == "SIDE_LEFT":
                 cn = 4
             elif camera_name == "FRONT_LEFT":
@@ -1435,10 +1365,6 @@ def main_semantic(composite_homographies_cache):
             images_semantic[cn] = img_pil
         success, composite_homographies_cache = stitch_segment("0", None, 1, Path(SEMANTIC_PANORAMA_DIR), frame_counter, composite_homographies_cache, images_semantic)
         frame_counter += 1
-        # Optional: Stop after processing a few frames for demonstration
-        # if frame_counter >= 2: # Uncomment and adjust to process only a few frames
-        #     print("Processed 2 full frames. Stopping example usage.")
-        #     break
 
     if frame_counter == 0:
         print("No complete frames (5 cameras with overlays) were generated.")
